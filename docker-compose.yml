@@ -6,15 +6,15 @@ services:
     container_name: postgres_db
     restart: always
     environment:
-      POSTGRES_USER: myuser
-      POSTGRES_PASSWORD: mypassword
-      POSTGRES_DB: mydatabase
+      POSTGRES_USER: ${DB_USER:-myuser}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-mypassword}
+      POSTGRES_DB: ${DB_NAME:-mydatabase}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U myuser -d mydatabase"]
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-myuser} -d ${DB_NAME:-mydatabase}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -25,10 +25,18 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DB_HOST: db
-      DB_NAME: mydatabase
-      DB_USER: myuser
-      DB_PASSWORD: mypassword
+      DB_HOST: ${DB_HOST:-db}
+      DB_NAME: ${DB_NAME:-mydatabase}
+      DB_USER: ${DB_USER:-myuser}
+      DB_PASSWORD: ${DB_PASSWORD:-mypassword}
+      # SMARTTHINGS_TOKEN: ${SMARTTHINGS_TOKEN}  <-- Removed single token support
+      SMARTTHINGS_CLIENT_ID: ${SMARTTHINGS_CLIENT_ID}
+      SMARTTHINGS_CLIENT_SECRET: ${SMARTTHINGS_CLIENT_SECRET}
+      REFRESH_TOKEN_1: ${REFRESH_TOKEN_1}
+      REFRESH_TOKEN_2: ${REFRESH_TOKEN_2}
+      REFRESH_TOKEN_3: ${REFRESH_TOKEN_3}
+      REFRESH_TOKEN_4: ${REFRESH_TOKEN_4}
+      REFRESH_TOKEN_5: ${REFRESH_TOKEN_5}
     depends_on:
        db:
            condition: service_healthy

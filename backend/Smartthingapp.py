@@ -6,12 +6,18 @@ import threading
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
 
 # Config
-SMARTTHINGS_TOKEN = os.getenv("SMARTTHINGS_TOKEN", "54ccf244-948b-4fef-9401-870230445961")
+SMARTTHINGS_CLIENT_ID = os.getenv("SMARTTHINGS_CLIENT_ID")
+SMARTTHINGS_CLIENT_SECRET = os.getenv("SMARTTHINGS_CLIENT_SECRET")
+# We expect REFRESH_TOKEN_1 ... REFRESH_TOKEN_5
+
 DB_CONFIG = {
     "host": os.getenv("DB_HOST", "db"),
     "user": os.getenv("DB_USER", "myuser"),
@@ -47,86 +53,182 @@ def init_db():
     cur.execute("ALTER TABLE ac_monitoring ADD COLUMN IF NOT EXISTS temperature_c FLOAT;")
     cur.execute("ALTER TABLE ac_monitoring ADD COLUMN IF NOT EXISTS air_conditioner_mode TEXT;")
     cur.execute("ALTER TABLE ac_monitoring ADD COLUMN IF NOT EXISTS fan_mode TEXT;")
+
+    # Table for storing rotating OAuth tokens
+    cur.execute('''
+        CREATE TABLE IF NOT EXISTS auth_tokens (
+            location_index INTEGER PRIMARY KEY,
+            refresh_token TEXT,
+            access_token TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    ''')
+    conn.commit()
+    
+    # Initialize tokens from env if table is empty
+    for i in range(1, 6):
+        cur.execute("SELECT 1 FROM auth_tokens WHERE location_index = %s", (i,))
+        if cur.fetchone() is None:
+            initial_refresh = os.getenv(f"REFRESH_TOKEN_{i}")
+            if initial_refresh:
+                print(f"Seeding initial token for Location {i}")
+                cur.execute('''
+                    INSERT INTO auth_tokens (location_index, refresh_token)
+                    VALUES (%s, %s)
+                ''', (i, initial_refresh))
+    
     conn.commit()
     cur.close()
     conn.close()
 
-def fetch_and_store():
-    """Talks to SmartThings and stores both Delta and Lifetime Energy"""
-    headers = {"Authorization": f"Bearer {SMARTTHINGS_TOKEN}"}
-    try:
-        r = requests.get("https://api.smartthings.com/v1/devices", headers=headers)
-        devices = r.json().get('items', [])
-        
-        conn = get_db_connection()
-        cur = conn.cursor()
-
-        for d in devices:
-            d_id = d['deviceId']
-            d_name = d.get('label') or d.get('name') or "Unknown AC"
-            loc = d.get('locationId', 'Main Home')
-
-            s_res = requests.get(f"https://api.smartthings.com/v1/devices/{d_id}/status", headers=headers)
-            if s_res.status_code == 200:
-                data = s_res.json()
-                main = data.get('components', {}).get('main', {})
-                report = main.get('powerConsumptionReport', {}).get('powerConsumption', {}).get('value', {})
-
-                delta_wh = report.get('deltaEnergy')
-                cum_wh = report.get('energy') # The large lifetime value
-
-                # New telemetry fields (best-effort, depends on device capabilities)
-                humidity = None
-                temperature_c = None
-                ac_mode = None
-                fan_mode = None
-
-                try:
-                    humidity_comp = main.get('relativeHumidityMeasurement', {}).get('humidity', {})
-                    humidity = float(humidity_comp.get('value')) if humidity_comp.get('value') is not None else None
-                except Exception:
-                    pass
-
-                try:
-                    temp_comp = main.get('temperatureMeasurement', {}).get('temperature', {})
-                    temperature_c = float(temp_comp.get('value')) if temp_comp.get('value') is not None else None
-                except Exception:
-                    pass
-
-                try:
-                    ac_mode_comp = main.get('airConditionerMode', {}).get('airConditionerMode', {})
-                    ac_mode = ac_mode_comp.get('value')
-                except Exception:
-                    pass
-
-                try:
-                    fan_mode_comp = main.get('fanMode', {}).get('fanMode', {})
-                    fan_mode = fan_mode_comp.get('value')
-                except Exception:
-                    pass
-
-                if delta_wh is not None:
-                    kwh_delta = float(delta_wh) / 1000.0
-                    cur.execute('''
-                        INSERT INTO ac_monitoring (
-                            device_name,
-                            location,
-                            delta_kwh,
-                            cumulative_wh,
-                            humidity,
-                            temperature_c,
-                            air_conditioner_mode,
-                            fan_mode
-                        )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ''', (d_name, loc, kwh_delta, cum_wh, humidity, temperature_c, ac_mode, fan_mode))
-        
-        conn.commit()
+def get_valid_access_token(location_index):
+    """
+    Retrieves a valid access token for the given location index.
+    If the current one is missing or we force a refresh, it calls the SmartThings API.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    cur.execute("SELECT refresh_token FROM auth_tokens WHERE location_index = %s", (location_index,))
+    row = cur.fetchone()
+    
+    if not row or not row[0]:
+        print(f"No refresh token found for Location {location_index}")
         cur.close()
         conn.close()
-        print(f"[{datetime.now()}] Data synchronized. Saved energy totals.")
+        return None
+        
+    current_refresh_token = row[0]
+    
+    # Exchange refresh token for a new access token
+    # https://auth-global.api.smartthings.com/oauth/token
+    try:
+        data = {
+            "grant_type": "refresh_token",
+            "client_id": SMARTTHINGS_CLIENT_ID,
+            "client_secret": SMARTTHINGS_CLIENT_SECRET,
+            "refresh_token": current_refresh_token
+        }
+        r = requests.post("https://auth-global.api.smartthings.com/oauth/token", data=data, auth=(SMARTTHINGS_CLIENT_ID, SMARTTHINGS_CLIENT_SECRET))
+        
+        if r.status_code != 200:
+            print(f"Error refreshing token for Loc {location_index}: {r.text}")
+            cur.close()
+            conn.close()
+            return None
+            
+        resp_json = r.json()
+        new_access_token = resp_json.get("access_token")
+        new_refresh_token = resp_json.get("refresh_token")
+        
+        if new_access_token and new_refresh_token:
+            print(f"Successfully refreshed token for Loc {location_index}")
+            cur.execute("""
+                UPDATE auth_tokens 
+                SET access_token = %s, refresh_token = %s, updated_at = NOW() 
+                WHERE location_index = %s
+            """, (new_access_token, new_refresh_token, location_index))
+            conn.commit()
+            cur.close()
+            conn.close()
+            return new_access_token
+            
     except Exception as e:
-        print(f"Error during fetch: {e}")
+        print(f"Exception refreshing token for Loc {location_index}: {e}")
+        
+    cur.close()
+    conn.close()
+    return None
+
+def fetch_and_store():
+    """Talks to SmartThings and stores data for all 5 locations"""
+    
+    for loc_idx in range(1, 6):
+        access_token = get_valid_access_token(loc_idx)
+        if not access_token:
+            continue
+            
+        headers = {"Authorization": f"Bearer {access_token}"}
+        try:
+            r = requests.get("https://api.smartthings.com/v1/devices", headers=headers)
+            if r.status_code == 401:
+                print(f"Loc {loc_idx}: 401 Unauthorized. Access token might have expired despite refresh attempt.")
+                continue
+                
+            devices = r.json().get('items', [])
+            print(f"Loc {loc_idx}: Found {len(devices)} raw devices via API.")
+            
+            conn = get_db_connection()
+            cur = conn.cursor()
+
+            for d in devices:
+                d_id = d['deviceId']
+                d_name = d.get('label') or d.get('name') or "Unknown AC"
+                
+                # Fetch detailed status
+                s_res = requests.get(f"https://api.smartthings.com/v1/devices/{d_id}/status", headers=headers)
+                if s_res.status_code == 200:
+                    data = s_res.json()
+                    main = data.get('components', {}).get('main', {})
+                    
+                    # We need location info - typically stored on the device object but often we just use 'Main Home'
+                    # With OAuth per location, we can assume all devices here belong to this "Location X" context
+                    # But the API returns locationId.
+                    real_loc_id = d.get('locationId', f'Location-{loc_idx}')
+                    
+                    report = main.get('powerConsumptionReport', {}).get('powerConsumption', {}).get('value', {})
+                    delta_wh = report.get('deltaEnergy')
+                    cum_wh = report.get('energy') 
+                    if delta_wh is None:
+                        print(f"NOTICE: Device '{d_name}' (ID: {d_id}) has no 'deltaEnergy'. Syncing anyway with 0.")
+                        delta_wh = 0
+                        cum_wh = cum_wh or 0
+
+                    # New telemetry fields
+                    humidity = None
+                    temperature_c = None
+                    ac_mode = None
+                    fan_mode = None
+
+                    try:
+                        humidity_comp = main.get('relativeHumidityMeasurement', {}).get('humidity', {})
+                        humidity = float(humidity_comp.get('value')) if humidity_comp.get('value') is not None else None
+                    except Exception: pass
+
+                    try:
+                        temp_comp = main.get('temperatureMeasurement', {}).get('temperature', {})
+                        temperature_c = float(temp_comp.get('value')) if temp_comp.get('value') is not None else None
+                    except Exception: pass
+
+                    try:
+                        ac_mode_comp = main.get('airConditionerMode', {}).get('airConditionerMode', {})
+                        ac_mode = ac_mode_comp.get('value')
+                    except Exception: pass
+
+                    try:
+                        fan_mode_comp = main.get('fanMode', {}).get('fanMode', {})
+                        fan_mode = fan_mode_comp.get('value')
+                    except Exception: pass
+
+                    if delta_wh is not None:
+                        kwh_delta = float(delta_wh) / 1000.0
+                        cur.execute('''
+                            INSERT INTO ac_monitoring (
+                                device_name, location, delta_kwh, cumulative_wh, 
+                                humidity, temperature_c, air_conditioner_mode, fan_mode
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        ''', (d_name, real_loc_id, kwh_delta, cum_wh, humidity, temperature_c, ac_mode, fan_mode))
+                else:
+                    print(f"WARNING: Loc {loc_idx} Device {d_name} - status call failed: {s_res.status_code}")
+            
+            conn.commit()
+            cur.close()
+            conn.close()
+            print(f"[{datetime.now()}] Data synchronized for Location {loc_idx}.")
+            
+        except Exception as e:
+            print(f"Error during fetch for Loc {loc_idx}: {e}")
 
 def background_loop():
     """Runs every 15 minutes"""
