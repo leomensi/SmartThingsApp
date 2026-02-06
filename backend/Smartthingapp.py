@@ -3,7 +3,9 @@ import time
 import os
 import requests
 import threading
-from flask import Flask, jsonify, request
+import csv
+import io
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from datetime import datetime
 from dotenv import load_dotenv
@@ -231,10 +233,27 @@ def fetch_and_store():
             print(f"Error during fetch for Loc {loc_idx}: {e}")
 
 def background_loop():
-    """Runs every 15 minutes"""
+    """Runs every 5 minutes, aligned to the clock (00, 05, 10...)"""
+    print("Background sync loop started.")
+    
+    # First run immediately or wait? User asked for 55, 60, 05. 
+    # Let's run once immediately to populate data, then wait for next mark.
+    fetch_and_store()
+
     while True:
-        fetch_and_store()
-        time.sleep(900) 
+        now = time.time()
+        # Calculate time to next 5-minute mark
+        # 300 seconds = 5 mins
+        # next_ts = current_ts + (300 - (current_ts % 300))
+        sleep_seconds = 300 - (now % 300)
+        
+        print(f"Sleeping for {sleep_seconds:.1f}s until next 5-minute mark...")
+        time.sleep(sleep_seconds)
+        
+        # Add a small buffer to ensure we are seemingly 'past' the mark
+        time.sleep(1) 
+        
+        fetch_and_store() 
 
 @app.route('/dashboard')
 def get_stats():
@@ -429,6 +448,71 @@ def get_history():
         })
 
     return jsonify(result)
+
+
+@app.route('/export')
+def export_csv():
+    """
+    Exports all AC data to CSV.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # Export last 30 days by default to keep it manageable, or all if needed.
+    # User asked for "medianet ac data", implying a dump.
+    query = '''
+        SELECT 
+            t1.timestamp,
+            t1.device_name,
+            t1.location,
+            t1.delta_kwh,
+            t1.cumulative_wh,
+            t1.humidity,
+            t1.temperature_c,
+            t1.air_conditioner_mode,
+            t1.fan_mode,
+            (
+                t1.cumulative_wh - COALESCE(
+                    (
+                        SELECT t2.cumulative_wh 
+                        FROM ac_monitoring t2 
+                        WHERE t2.device_name = t1.device_name 
+                          AND t2.timestamp <= t1.timestamp - INTERVAL '24 hours' 
+                        ORDER BY t2.timestamp DESC 
+                        LIMIT 1
+                    ), 
+                    t1.cumulative_wh
+                )
+            ) / 1000.0 as rolling_24h_kwh
+        FROM ac_monitoring t1
+        ORDER BY t1.device_name ASC, t1.timestamp DESC
+        LIMIT 10000; -- Safety limit for now
+    '''
+    
+    cur.execute(query)
+    rows = cur.fetchall()
+    
+    # Create CSV in memory
+    si = io.StringIO()
+    cw = csv.writer(si)
+    cw.writerow(['Timestamp', 'Device Name', 'Location', 'Delta kWh', 'Cumulative Wh', 'Humidity (%)', 'Temperature (C)', 'AC Mode', 'Fan Mode', '24h Usage (kWh)'])
+    
+    for row in rows:
+        cw.writerow(row)
+        
+    cur.close()
+    conn.close()
+    
+    output = io.BytesIO()
+    output.write(si.getvalue().encode('utf-8'))
+    output.seek(0)
+    
+    return send_file(
+        output,
+        mimetype='text/csv',
+        as_attachment=True,
+        download_name=f'ac_data_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
+    )
 
 
 if __name__ == '__main__':

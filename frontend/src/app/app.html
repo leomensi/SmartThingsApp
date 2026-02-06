@@ -22,7 +22,12 @@
     <aside class="sidebar">
       <div class="sidebar-header">
         <h1>Climate Control</h1>
-        <div class="status-badge">Online</div>
+        <div style="display: flex; gap: 8px; align-items: center;">
+          <div class="status-badge">Online</div>
+          <button class="btn btn-sm" (click)="exportCsv()" title="Export CSV">
+            ⬇️
+          </button>
+        </div>
       </div>
 
       <div class="device-list">
@@ -30,7 +35,10 @@
           (click)="selectDevice(device)">
           <div class="device-info">
             <span class="device-name">{{ device.deviceName }}</span>
-            <span class="device-loc">{{ device.location }}</span>
+            <div style="display: flex; gap: 8px; font-size: 0.8rem; color: var(--text-secondary);">
+              <span>{{ device.location }}</span>
+              <span *ngIf="device.humidity != null">💧 {{ device.humidity | number:'1.0-0' }}%</span>
+            </div>
           </div>
           <div class="device-stat">
             {{ device.todayKWh | number:'1.1-1' }} <small>kWh</small>
@@ -112,6 +120,7 @@
                   <th>Time</th>
                   <th>Energy</th>
                   <th>Temp</th>
+                  <th>Humidity</th>
                   <th>Mode</th>
                 </tr>
               </thead>
@@ -120,6 +129,7 @@
                   <td>{{ row.timestamp | date:'HH:mm' }}</td>
                   <td>{{ row.deltaKWh | number:'1.3-3' }}</td>
                   <td>{{ row.temperatureC ? (row.temperatureC | number:'1.1-1') + '°' : '--' }}</td>
+                  <td>{{ row.humidity ? (row.humidity | number:'1.0-0') + '%' : '--' }}</td>
                   <td>{{ row.airConditionerMode || '-' }}</td>
                 </tr>
               </tbody>

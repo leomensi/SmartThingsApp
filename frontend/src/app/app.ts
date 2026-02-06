@@ -178,6 +178,10 @@ export class App implements OnInit, OnDestroy {
     });
   }
 
+  exportCsv() {
+    window.open(`${this.apiBase}/export`, '_blank');
+  }
+
   // Helpers
   formatLastUpdate(isoDate: string): string {
     if (!isoDate) return 'Never';
