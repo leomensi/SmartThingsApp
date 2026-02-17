@@ -15,10 +15,13 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
+# ========== 24-HOUR TOKEN - REPLACE THIS ===========
+# Replace empty string with your 24h SmartThings token
+# Token format: eyJhbGciOi... (JWT format, not UUID)
+TOKEN_24H = "b50de4ac-6120-4cc5-a3f5-118cd40ffa16"
+# ====================================================
+
 # Config
-SMARTTHINGS_CLIENT_ID = os.getenv("SMARTTHINGS_CLIENT_ID")
-SMARTTHINGS_CLIENT_SECRET = os.getenv("SMARTTHINGS_CLIENT_SECRET")
-# We expect REFRESH_TOKEN_1 ... REFRESH_TOKEN_5
 
 DB_CONFIG = {
     "host": os.getenv("DB_HOST", "db"),
@@ -55,182 +58,91 @@ def init_db():
     cur.execute("ALTER TABLE ac_monitoring ADD COLUMN IF NOT EXISTS temperature_c FLOAT;")
     cur.execute("ALTER TABLE ac_monitoring ADD COLUMN IF NOT EXISTS air_conditioner_mode TEXT;")
     cur.execute("ALTER TABLE ac_monitoring ADD COLUMN IF NOT EXISTS fan_mode TEXT;")
-
-    # Table for storing rotating OAuth tokens
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS auth_tokens (
-            location_index INTEGER PRIMARY KEY,
-            refresh_token TEXT,
-            access_token TEXT,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    ''')
-    conn.commit()
-    
-    # Initialize tokens from env if table is empty
-    for i in range(1, 6):
-        cur.execute("SELECT 1 FROM auth_tokens WHERE location_index = %s", (i,))
-        if cur.fetchone() is None:
-            initial_refresh = os.getenv(f"REFRESH_TOKEN_{i}")
-            if initial_refresh:
-                print(f"Seeding initial token for Location {i}")
-                cur.execute('''
-                    INSERT INTO auth_tokens (location_index, refresh_token)
-                    VALUES (%s, %s)
-                ''', (i, initial_refresh))
     
     conn.commit()
     cur.close()
     conn.close()
-
-def get_valid_access_token(location_index):
-    """
-    Retrieves a valid access token for the given location index.
-    If the current one is missing or we force a refresh, it calls the SmartThings API.
-    """
-    conn = get_db_connection()
-    cur = conn.cursor()
-    
-    cur.execute("SELECT refresh_token FROM auth_tokens WHERE location_index = %s", (location_index,))
-    row = cur.fetchone()
-    
-    if not row or not row[0]:
-        print(f"No refresh token found for Location {location_index}")
-        cur.close()
-        conn.close()
-        return None
-        
-    current_refresh_token = row[0]
-    
-    # Exchange refresh token for a new access token
-    # https://auth-global.api.smartthings.com/oauth/token
-    try:
-        data = {
-            "grant_type": "refresh_token",
-            "client_id": SMARTTHINGS_CLIENT_ID,
-            "client_secret": SMARTTHINGS_CLIENT_SECRET,
-            "refresh_token": current_refresh_token
-        }
-        r = requests.post("https://auth-global.api.smartthings.com/oauth/token", data=data, auth=(SMARTTHINGS_CLIENT_ID, SMARTTHINGS_CLIENT_SECRET))
-        
-        if r.status_code != 200:
-            print(f"Error refreshing token for Loc {location_index}: {r.text}")
-            cur.close()
-            conn.close()
-            return None
-            
-        resp_json = r.json()
-        new_access_token = resp_json.get("access_token")
-        new_refresh_token = resp_json.get("refresh_token")
-        
-        if new_access_token and new_refresh_token:
-            print(f"Successfully refreshed token for Loc {location_index}")
-            cur.execute("""
-                UPDATE auth_tokens 
-                SET access_token = %s, refresh_token = %s, updated_at = NOW() 
-                WHERE location_index = %s
-            """, (new_access_token, new_refresh_token, location_index))
-            conn.commit()
-            cur.close()
-            conn.close()
-            return new_access_token
-            
-    except Exception as e:
-        print(f"Exception refreshing token for Loc {location_index}: {e}")
-        
-    cur.close()
-    conn.close()
-    return None
 
 def fetch_and_store():
-    """Talks to SmartThings and stores data for all 5 locations"""
+    """Talks to SmartThings and stores data - single API call for all devices"""
     
-    for loc_idx in range(1, 6):
-        access_token = get_valid_access_token(loc_idx)
-        if not access_token:
-            continue
+    # Use the 24-hour token
+    headers = {"Authorization": f"Bearer {TOKEN_24H}"}
+    try:
+        r = requests.get("https://api.smartthings.com/v1/devices", headers=headers)
+        if r.status_code == 401:
+            print(f"Loc(X): 401 Unauthorized. Access token might have expired.")
+            return
             
-        headers = {"Authorization": f"Bearer {access_token}"}
-        try:
-            r = requests.get("https://api.smartthings.com/v1/devices", headers=headers)
-            if r.status_code == 401:
-                print(f"Loc {loc_idx}: 401 Unauthorized. Access token might have expired despite refresh attempt.")
-                continue
+        devices = r.json().get('items', [])
+        print(f"Loc(X): Found {len(devices)} raw devices API")
+        
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        for d in devices:
+            d_id = d['deviceId']
+            d_name = d.get('label') or d.get('name') or "Unknown AC"
+            
+            # Fetch detailed status
+            s_res = requests.get(f"https://api.smartthings.com/v1/devices/{d_id}/status", headers=headers)
+            if s_res.status_code == 200:
+                data = s_res.json()
+                main = data.get('components', {}).get('main', {})
                 
-            devices = r.json().get('items', [])
-            print(f"Loc {loc_idx}: Found {len(devices)} raw devices via API.")
-            
-            conn = get_db_connection()
-            cur = conn.cursor()
-
-            for d in devices:
-                d_id = d['deviceId']
-                d_name = d.get('label') or d.get('name') or "Unknown AC"
+                # Get location info from device
+                real_loc_id = d.get('locationId', 'Unknown Location')
                 
-                # Fetch detailed status
-                s_res = requests.get(f"https://api.smartthings.com/v1/devices/{d_id}/status", headers=headers)
-                if s_res.status_code == 200:
-                    data = s_res.json()
-                    main = data.get('components', {}).get('main', {})
-                    
-                    # We need location info - typically stored on the device object but often we just use 'Main Home'
-                    # With OAuth per location, we can assume all devices here belong to this "Location X" context
-                    # But the API returns locationId.
-                    real_loc_id = d.get('locationId', f'Location-{loc_idx}')
-                    
-                    report = main.get('powerConsumptionReport', {}).get('powerConsumption', {}).get('value', {})
-                    delta_wh = report.get('deltaEnergy')
-                    cum_wh = report.get('energy') 
-                    if delta_wh is None:
-                        print(f"NOTICE: Device '{d_name}' (ID: {d_id}) has no 'deltaEnergy'. Syncing anyway with 0.")
-                        delta_wh = 0
-                        cum_wh = cum_wh or 0
+                report = main.get('powerConsumptionReport', {}).get('powerConsumption', {}).get('value', {})
+                delta_wh = report.get('deltaEnergy')
+                cum_wh = report.get('energy') 
+                if delta_wh is None:
+                    # Suppress verbose notice messages
+                    delta_wh = 0
+                    cum_wh = cum_wh or 0
 
-                    # New telemetry fields
-                    humidity = None
-                    temperature_c = None
-                    ac_mode = None
-                    fan_mode = None
+                # New telemetry fields
+                humidity = None
+                temperature_c = None
+                ac_mode = None
+                fan_mode = None
 
-                    try:
-                        humidity_comp = main.get('relativeHumidityMeasurement', {}).get('humidity', {})
-                        humidity = float(humidity_comp.get('value')) if humidity_comp.get('value') is not None else None
-                    except Exception: pass
+                try:
+                    humidity_comp = main.get('relativeHumidityMeasurement', {}).get('humidity', {})
+                    humidity = float(humidity_comp.get('value')) if humidity_comp.get('value') is not None else None
+                except Exception: pass
 
-                    try:
-                        temp_comp = main.get('temperatureMeasurement', {}).get('temperature', {})
-                        temperature_c = float(temp_comp.get('value')) if temp_comp.get('value') is not None else None
-                    except Exception: pass
+                try:
+                    temp_comp = main.get('temperatureMeasurement', {}).get('temperature', {})
+                    temperature_c = float(temp_comp.get('value')) if temp_comp.get('value') is not None else None
+                except Exception: pass
 
-                    try:
-                        ac_mode_comp = main.get('airConditionerMode', {}).get('airConditionerMode', {})
-                        ac_mode = ac_mode_comp.get('value')
-                    except Exception: pass
+                try:
+                    ac_mode_comp = main.get('airConditionerMode', {}).get('airConditionerMode', {})
+                    ac_mode = ac_mode_comp.get('value')
+                except Exception: pass
 
-                    try:
-                        fan_mode_comp = main.get('fanMode', {}).get('fanMode', {})
-                        fan_mode = fan_mode_comp.get('value')
-                    except Exception: pass
+                try:
+                    fan_mode_comp = main.get('fanMode', {}).get('fanMode', {})
+                    fan_mode = fan_mode_comp.get('value')
+                except Exception: pass
 
-                    if delta_wh is not None:
-                        kwh_delta = float(delta_wh) / 1000.0
-                        cur.execute('''
-                            INSERT INTO ac_monitoring (
-                                device_name, location, delta_kwh, cumulative_wh, 
-                                humidity, temperature_c, air_conditioner_mode, fan_mode
-                            )
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                        ''', (d_name, real_loc_id, kwh_delta, cum_wh, humidity, temperature_c, ac_mode, fan_mode))
-                else:
-                    print(f"WARNING: Loc {loc_idx} Device {d_name} - status call failed: {s_res.status_code}")
-            
-            conn.commit()
-            cur.close()
-            conn.close()
-            print(f"[{datetime.now()}] Data synchronized for Location {loc_idx}.")
-            
-        except Exception as e:
-            print(f"Error during fetch for Loc {loc_idx}: {e}")
+                if delta_wh is not None:
+                    kwh_delta = float(delta_wh) / 1000.0
+                    cur.execute('''
+                        INSERT INTO ac_monitoring (
+                            device_name, location, delta_kwh, cumulative_wh, 
+                            humidity, temperature_c, air_conditioner_mode, fan_mode
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ''', (d_name, real_loc_id, kwh_delta, cum_wh, humidity, temperature_c, ac_mode, fan_mode))
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+    except Exception as e:
+        print(f"Error during fetch: {e}")
 
 def background_loop():
     """Runs every 5 minutes, aligned to the clock (00, 05, 10...)"""
@@ -240,20 +152,22 @@ def background_loop():
     # Let's run once immediately to populate data, then wait for next mark.
     fetch_and_store()
 
+    last_run_slot = None
+
     while True:
         now = time.time()
-        # Calculate time to next 5-minute mark
-        # 300 seconds = 5 mins
-        # next_ts = current_ts + (300 - (current_ts % 300))
-        sleep_seconds = 300 - (now % 300)
-        
-        print(f"Sleeping for {sleep_seconds:.1f}s until next 5-minute mark...")
-        time.sleep(sleep_seconds)
-        
-        # Add a small buffer to ensure we are seemingly 'past' the mark
-        time.sleep(1) 
-        
-        fetch_and_store() 
+        current_slot = int(now) // 300
+
+        if current_slot != last_run_slot:
+            # Wait until just AFTER the exact 5-minute boundary
+            next_mark = (current_slot + 1) * 300
+            sleep_time = next_mark - now
+            time.sleep(sleep_time + 1)
+
+            fetch_and_store()
+            last_run_slot = current_slot + 1
+        else:
+            time.sleep(30)
 
 @app.route('/dashboard')
 def get_stats():
@@ -485,8 +399,8 @@ def export_csv():
                 )
             ) / 1000.0 as rolling_24h_kwh
         FROM ac_monitoring t1
-        ORDER BY t1.device_name ASC, t1.timestamp DESC
-        LIMIT 10000; -- Safety limit for now
+        ORDER BY t1.timestamp DESC  
+        LIMIT 40000; -- Safety limit for now
     '''
     
     cur.execute(query)
