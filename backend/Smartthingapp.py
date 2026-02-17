@@ -399,8 +399,7 @@ def export_csv():
                 )
             ) / 1000.0 as rolling_24h_kwh
         FROM ac_monitoring t1
-        ORDER BY t1.timestamp DESC  
-        LIMIT 40000; -- Safety limit for now
+        ORDER BY t1.timestamp DESC ;
     '''
     
     cur.execute(query)
