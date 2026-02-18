@@ -324,3 +324,82 @@
     transform: rotate(360deg);
   }
 }
+
+/* Token box enhancements (visual only) */
+.token-box {
+  margin: 1rem;
+  padding: 1rem;
+  background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));
+  border: 1px solid rgba(88,166,255,0.12);
+  border-radius: 10px;
+  box-shadow: 0 6px 18px rgba(2,6,23,0.6), inset 0 1px 0 rgba(255,255,255,0.02);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.token-box .token-title {
+  font-weight: 700;
+  font-size: 0.85rem;
+  color: var(--text-primary);
+}
+
+.token-input {
+  width: 100%;
+  padding: 10px 12px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, 'Roboto Mono', monospace;
+  font-size: 0.95rem;
+  letter-spacing: 0.14rem;
+  color: var(--text-primary);
+  background: linear-gradient(90deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));
+  border: 1px solid rgba(255,255,255,0.04);
+  border-radius: 8px;
+  outline: none;
+  transition: box-shadow 0.18s ease, border-color 0.18s ease, transform 0.08s ease;
+  box-shadow: 0 2px 6px rgba(2,6,23,0.45);
+}
+
+.token-input::placeholder {
+  color: var(--text-secondary);
+  letter-spacing: 0.12rem;
+}
+
+.token-input:focus {
+  border-color: var(--accent-color);
+  box-shadow: 0 6px 24px rgba(88,166,255,0.12);
+  transform: translateY(-1px);
+}
+
+.token-countdown {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  background: rgba(255,255,255,0.02);
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid rgba(255,255,255,0.02);
+}
+
+.token-hint {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+.token-error {
+  font-size: 0.82rem;
+  color: #ff6b6b;
+  margin-top: 6px;
+}
+
+/* make save button tighter inside token box */
+.token-box .btn-primary {
+  padding: 8px 14px;
+  font-size: 0.85rem;
+}
+
+/* Subtle separator to emphasize token groups visually */
+.token-input {
+  background-image: linear-gradient(90deg, rgba(255,255,255,0.01) 0%, rgba(255,255,255,0.01) 100%);
+  background-size: 16px 100%;
+  background-repeat: repeat-x;
+}

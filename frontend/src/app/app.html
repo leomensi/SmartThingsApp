@@ -12,6 +12,19 @@
       <h2>Connection Failed</h2>
       <p>{{ error() }}</p>
       <button class="btn btn-primary" (click)="loadData()">Retry</button>
+
+      <!-- Inline token box so user can submit new token from error screen -->
+      <div style="margin-top:16px;">
+        <div class="token-box card">
+          <div class="token-title">24h Token (Update to regain access)</div>
+          <input class="token-input" [(ngModel)]="tokenValue" placeholder="Enter token - must contain '-'" />
+          <div style="display:flex; gap:8px; margin-top:8px; align-items:center;">
+            <button class="btn btn-primary btn-sm" (click)="saveToken()">Save Token</button>
+            <div class="token-countdown">{{ tokenCountdownText() }}</div>
+          </div>
+          <div *ngIf="tokenError" class="token-error">{{ tokenError }}</div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -28,6 +41,18 @@
             ⬇️
           </button>
         </div>
+      </div>
+
+      <!-- Token device box -->
+      <div class="token-box card">
+        <div class="token-title">24h Token</div>
+        <input class="token-input" [(ngModel)]="tokenValue" placeholder="Enter token - must contain '-'" />
+        <div style="display:flex; gap:8px; margin-top:8px; align-items:center;">
+          <button class="btn btn-primary btn-sm" (click)="saveToken()">Save</button>
+          <div class="token-countdown">{{ tokenCountdownText() }}</div>
+        </div>
+        
+        <div *ngIf="tokenError" class="token-error">{{ tokenError }}</div>
       </div>
 
       <div class="device-list">

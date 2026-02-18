@@ -1,5 +1,6 @@
 import { Component, OnDestroy, OnInit, computed, signal } from '@angular/core';
 import { CommonModule, DecimalPipe, DatePipe } from '@angular/common';
+import { FormsModule } from '@angular/forms';
 import { HttpClient } from '@angular/common/http';
 
 /* Interfaces */
@@ -43,7 +44,7 @@ export interface HourlyLookup {
 @Component({
   selector: 'app-root',
   standalone: true,
-  imports: [CommonModule, DecimalPipe, DatePipe], // Explicitly import Pipes
+  imports: [CommonModule, DecimalPipe, DatePipe, FormsModule], // Explicitly import Pipes and Forms
   styleUrl: './app.css',
   templateUrl: './app.html' // Use external template for cleanliness
 })
@@ -60,6 +61,12 @@ export class App implements OnInit, OnDestroy {
 
   protected readonly history = signal<DeviceHistoryPoint[]>([]);
   protected readonly historyLoading = signal(false);
+
+  // Token UI
+  protected readonly tokenValue = signal('');
+  protected readonly tokenError = signal<string | null>(null);
+  protected readonly tokenUpdatedAt = signal<string | null>(null);
+  protected readonly tokenSecondsLeft = signal<number | null>(null);
 
   // Computed
   protected readonly selectedDevice = computed(() => {
@@ -82,17 +89,22 @@ export class App implements OnInit, OnDestroy {
   });
 
   private refreshTimer: any;
+  private tokenTimer: any;
+  private tokenRefetchTimer: any;
 
   constructor(private http: HttpClient) { }
 
   ngOnInit() {
     this.loadData();
+    this.loadTokenInfo();
+    this.startTokenTimers();
     // Refresh every minute
     this.refreshTimer = setInterval(() => this.loadData(), 60000);
   }
 
   ngOnDestroy() {
     if (this.refreshTimer) clearInterval(this.refreshTimer);
+    this.stopTokenTimers();
   }
 
   // Actions
@@ -180,6 +192,88 @@ export class App implements OnInit, OnDestroy {
 
   exportCsv() {
     window.open(`${this.apiBase}/export`, '_blank');
+  }
+
+  // Token API
+  loadTokenInfo() {
+    this.http.get<any>(`${this.apiBase}/token`).subscribe({
+      next: (res) => {
+        if (res && res.updatedAt) {
+          this.tokenUpdatedAt.set(res.updatedAt);
+          this.tokenSecondsLeft.set(res.secondsLeft || null);
+        }
+      },
+      error: () => { /* ignore */ }
+    });
+  }
+
+  saveToken() {
+    const val = this.tokenValue();
+    // client-side validation to match backend rules
+    if (!val || val.trim() === '') {
+      this.tokenError.set('Token must not be empty');
+      return;
+    }
+    if (/^[A-Za-z]+$/.test(val)) {
+      this.tokenError.set('Token must not be only letters');
+      return;
+    }
+    if (/^[0-9]+$/.test(val)) {
+      this.tokenError.set('Token must not be only numbers');
+      return;
+    }
+    if (!val.includes('-')) {
+      this.tokenError.set("Token must contain a dash (-)");
+      return;
+    }
+
+    this.tokenError.set(null);
+    this.http.post<any>(`${this.apiBase}/token`, { token: val }).subscribe({
+      next: (res) => {
+        // If server reset the timer (new token), show 24h; if same token, keep remaining time.
+        if (res && res.reset) {
+          this.tokenUpdatedAt.set(res.updatedAt || new Date().toISOString());
+          this.tokenSecondsLeft.set(res.secondsLeft || 24 * 3600);
+        } else {
+          if (res && res.secondsLeft != null) this.tokenSecondsLeft.set(res.secondsLeft);
+          if (res && res.updatedAt) this.tokenUpdatedAt.set(res.updatedAt);
+        }
+
+        this.tokenError.set(null);
+        // Re-sync authoritative state from server
+        this.loadTokenInfo();
+      },
+      error: (err) => {
+        this.tokenError.set(err?.error?.error || 'Failed to save token');
+      }
+    });
+  }
+
+  tokenCountdownText(): string {
+    const s = this.tokenSecondsLeft();
+    if (s == null) return 'No token set';
+    if (s <= 0) return 'Expired';
+    const hrs = Math.floor(s / 3600);
+    const mins = Math.floor((s % 3600) / 60);
+    return `${hrs}h ${mins}m left`;
+  }
+
+  private startTokenTimers() {
+    if (this.tokenTimer) return;
+    // Decrement local counter every second for instant feedback
+    this.tokenTimer = setInterval(() => {
+      const s = this.tokenSecondsLeft();
+      if (s == null) return;
+      if (s > 0) this.tokenSecondsLeft.set(s - 1);
+    }, 1000);
+
+    // Periodically re-sync with server to avoid drift or missed resets
+    this.tokenRefetchTimer = setInterval(() => this.loadTokenInfo(), 60000);
+  }
+
+  private stopTokenTimers() {
+    if (this.tokenTimer) { clearInterval(this.tokenTimer); this.tokenTimer = null; }
+    if (this.tokenRefetchTimer) { clearInterval(this.tokenRefetchTimer); this.tokenRefetchTimer = null; }
   }
 
   // Helpers

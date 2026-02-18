@@ -1,0 +1,2 @@
+TOKEN_24H = ""
+TOKEN_24H_UPDATED_AT = ""

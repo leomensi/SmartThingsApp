@@ -7,7 +7,8 @@ import csv
 import io
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
-from datetime import datetime
+from datetime import datetime, timedelta
+import json
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,10 +17,45 @@ app = Flask(__name__)
 CORS(app)
 
 # ========== 24-HOUR TOKEN - REPLACE THIS ===========
-# Replace empty string with your 24h SmartThings token
-# Token format: eyJhbGciOi... (JWT format, not UUID)
+# Token is persisted to ../token.py by the update endpoint.
 TOKEN_24H = "b50de4ac-6120-4cc5-a3f5-118cd40ffa16"
-# ====================================================
+# ISO timestamp when token was last set (UTC)
+TOKEN_24H_UPDATED_AT = None
+TOKEN_FILE_PATH = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'token.py'))
+
+def load_token_from_file():
+    global TOKEN_24H, TOKEN_24H_UPDATED_AT
+    try:
+        if os.path.exists(TOKEN_FILE_PATH):
+            with open(TOKEN_FILE_PATH, 'r', encoding='utf-8') as f:
+                data = f.read()
+            # Very small parser: look for TOKEN_24H and TOKEN_24H_UPDATED_AT assignments
+            import re
+            m = re.search(r"TOKEN_24H\s*=\s*['\"](.+?)['\"]", data)
+            if m:
+                TOKEN_24H = m.group(1)
+            m2 = re.search(r"TOKEN_24H_UPDATED_AT\s*=\s*['\"](.+?)['\"]", data)
+            if m2:
+                TOKEN_24H_UPDATED_AT = m2.group(1)
+    except Exception as e:
+        print(f"Could not load token file: {e}")
+
+def write_token_to_file(token_value, updated_at_iso):
+    # Writes a simple token.py that other tools may read.
+    content = f"TOKEN_24H = \"{token_value}\"\nTOKEN_24H_UPDATED_AT = \"{updated_at_iso}\"\n"
+    with open(TOKEN_FILE_PATH, 'w', encoding='utf-8') as f:
+        f.write(content)
+
+# Try load persisted token on startup
+load_token_from_file()
+
+# Track last background fetch status for UI consumption
+LAST_FETCH_STATUS = {
+    'ok': True,
+    'code': None,
+    'message': 'Not yet fetched',
+    'timestamp': None
+}
 
 # Config
 
@@ -58,10 +94,107 @@ def init_db():
     cur.execute("ALTER TABLE ac_monitoring ADD COLUMN IF NOT EXISTS temperature_c FLOAT;")
     cur.execute("ALTER TABLE ac_monitoring ADD COLUMN IF NOT EXISTS air_conditioner_mode TEXT;")
     cur.execute("ALTER TABLE ac_monitoring ADD COLUMN IF NOT EXISTS fan_mode TEXT;")
+    # Store the original API timestamp when available to detect repeated API samples
+    cur.execute("ALTER TABLE ac_monitoring ADD COLUMN IF NOT EXISTS api_timestamp TIMESTAMP;")
     
     conn.commit()
     cur.close()
     conn.close()
+
+
+def _parse_report_timestamp(val):
+    """Try to parse a timestamp value from the API report into a Python datetime or None.
+
+    Accepts ISO strings or integer epoch (seconds or milliseconds).
+    """
+    if not val:
+        return None
+    try:
+        # numeric epoch?
+        if isinstance(val, (int, float)):
+            # if milliseconds, assume > 10^12
+            if val > 1e12:
+                return datetime.fromtimestamp(val / 1000.0)
+            return datetime.fromtimestamp(val)
+        s = str(val)
+        # try ISO
+        try:
+            return datetime.fromisoformat(s)
+        except Exception:
+            pass
+        # try integer string
+        if s.isdigit():
+            v = int(s)
+            if v > 1e12:
+                return datetime.fromtimestamp(v / 1000.0)
+            return datetime.fromtimestamp(v)
+    except Exception:
+        return None
+    return None
+
+
+def compute_adjusted_delta(cur, device_name: str, api_ts, new_delta_wh: float):
+    """Compute adjusted delta energy in Wh.
+
+    If api_ts matches the previous API timestamp for this device, return
+    new_delta_wh - previous_delta_wh (previous stored delta converted back to Wh).
+    Otherwise return new_delta_wh.
+
+    `cur` is an open DB cursor.
+    """
+    if api_ts is None:
+        return new_delta_wh
+
+    try:
+        # Fetch the latest stored row for this device
+        cur.execute(
+            "SELECT delta_kwh, api_timestamp FROM ac_monitoring WHERE device_name = %s ORDER BY id DESC LIMIT 1;",
+            (device_name,)
+        )
+        row = cur.fetchone()
+        if not row:
+            return new_delta_wh
+
+        prev_delta_kwh, prev_api_ts = row[0], row[1]
+        if prev_api_ts is None:
+            return new_delta_wh
+
+        # Normalize datetimes for comparison
+        if isinstance(prev_api_ts, str):
+            try:
+                prev_api_dt = datetime.fromisoformat(prev_api_ts)
+            except Exception:
+                prev_api_dt = None
+        else:
+            prev_api_dt = prev_api_ts
+
+        if prev_api_dt is None:
+            return new_delta_wh
+
+        # If timestamps are effectively the same (within 1 second), adjust
+        try:
+            if abs((prev_api_dt - api_ts).total_seconds()) < 1:
+                prev_delta_wh = (prev_delta_kwh or 0) * 1000.0
+                adjusted = new_delta_wh - prev_delta_wh
+                # if adjusted negative or tiny, fallback to new_delta_wh
+                if adjusted <= 0:
+                    return new_delta_wh
+                return adjusted
+        except Exception:
+            # fallback to strict equality if subtraction fails
+            if prev_api_dt == api_ts:
+                prev_delta_wh = (prev_delta_kwh or 0) * 1000.0
+                adjusted = new_delta_wh - prev_delta_wh
+                if adjusted <= 0:
+                    return new_delta_wh
+                return adjusted
+            
+    except Exception as e:
+        # on any error, don't disrupt main flow
+        print(f"compute_adjusted_delta error: {e}")
+        return new_delta_wh
+
+    return new_delta_wh
 
 def fetch_and_store():
     """Talks to SmartThings and stores data - single API call for all devices"""
@@ -72,6 +205,21 @@ def fetch_and_store():
         r = requests.get("https://api.smartthings.com/v1/devices", headers=headers)
         if r.status_code == 401:
             print(f"Loc(X): 401 Unauthorized. Access token might have expired.")
+            LAST_FETCH_STATUS.update({
+                'ok': False,
+                'code': 401,
+                'message': 'Unauthorized - token may be expired',
+                'timestamp': datetime.utcnow().isoformat()
+            })
+            return
+        elif r.status_code != 200:
+            LAST_FETCH_STATUS.update({
+                'ok': False,
+                'code': r.status_code,
+                'message': f'HTTP {r.status_code}',
+                'timestamp': datetime.utcnow().isoformat()
+            })
+            print(f"Loc(X): Devices API returned {r.status_code}")
             return
             
         devices = r.json().get('items', [])
@@ -101,6 +249,14 @@ def fetch_and_store():
                     delta_wh = 0
                     cum_wh = cum_wh or 0
 
+                # Try to read API-provided timestamp (various possible keys)
+                report_ts_raw = None
+                for k in ('timestamp', 'time', 'timeStamp', 'reportedAt'):
+                    if k in report:
+                        report_ts_raw = report.get(k)
+                        break
+                api_ts = _parse_report_timestamp(report_ts_raw)
+
                 # New telemetry fields
                 humidity = None
                 temperature_c = None
@@ -128,21 +284,48 @@ def fetch_and_store():
                 except Exception: pass
 
                 if delta_wh is not None:
-                    kwh_delta = float(delta_wh) / 1000.0
-                    cur.execute('''
-                        INSERT INTO ac_monitoring (
-                            device_name, location, delta_kwh, cumulative_wh, 
-                            humidity, temperature_c, air_conditioner_mode, fan_mode
-                        )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                    ''', (d_name, real_loc_id, kwh_delta, cum_wh, humidity, temperature_c, ac_mode, fan_mode))
+                    # Adjust delta if API returned the same sample timestamp as previous
+                    try:
+                        adjusted_delta_wh = compute_adjusted_delta(cur, d_name, api_ts, float(delta_wh))
+                    except Exception:
+                        adjusted_delta_wh = float(delta_wh)
+
+                    kwh_delta = float(adjusted_delta_wh) / 1000.0
+                    # Insert api_timestamp when available for future comparisons
+                    if api_ts is not None:
+                        cur.execute('''
+                            INSERT INTO ac_monitoring (
+                                device_name, location, delta_kwh, cumulative_wh, 
+                                humidity, temperature_c, air_conditioner_mode, fan_mode, api_timestamp
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ''', (d_name, real_loc_id, kwh_delta, cum_wh, humidity, temperature_c, ac_mode, fan_mode, api_ts))
+                    else:
+                        cur.execute('''
+                            INSERT INTO ac_monitoring (
+                                device_name, location, delta_kwh, cumulative_wh, 
+                                humidity, temperature_c, air_conditioner_mode, fan_mode
+                            )
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        ''', (d_name, real_loc_id, kwh_delta, cum_wh, humidity, temperature_c, ac_mode, fan_mode))
         
         conn.commit()
         cur.close()
         conn.close()
-        
+        LAST_FETCH_STATUS.update({
+            'ok': True,
+            'code': 200,
+            'message': f'Last fetch OK ({len(devices)} devices)',
+            'timestamp': datetime.utcnow().isoformat()
+        })
     except Exception as e:
         print(f"Error during fetch: {e}")
+        LAST_FETCH_STATUS.update({
+            'ok': False,
+            'code': None,
+            'message': f'Exception: {e}',
+            'timestamp': datetime.utcnow().isoformat()
+        })
 
 def background_loop():
     """Runs every 5 minutes, aligned to the clock (00, 05, 10...)"""
@@ -426,6 +609,100 @@ def export_csv():
         as_attachment=True,
         download_name=f'ac_data_{datetime.now().strftime("%Y%m%d_%H%M%S")}.csv'
     )
+
+
+@app.route('/fetch_status')
+def fetch_status():
+    """Returns last background fetch status for the frontend to display errors."""
+    return jsonify(LAST_FETCH_STATUS)
+
+
+@app.route('/token', methods=['GET'])
+def get_token_info():
+    """Returns token and time-left until 24h expiry."""
+    updated = TOKEN_24H_UPDATED_AT
+    now = datetime.utcnow()
+    if updated:
+        try:
+            updated_dt = datetime.fromisoformat(updated)
+        except Exception:
+            updated_dt = None
+    else:
+        updated_dt = None
+
+    seconds_left = None
+    expires_at = None
+    if updated_dt:
+        expires_at_dt = updated_dt + timedelta(hours=24)
+        expires_at = expires_at_dt.isoformat()
+        delta = (expires_at_dt - now)
+        seconds_left = int(max(0, delta.total_seconds()))
+
+    # Mask token when returning
+    masked = None
+    if TOKEN_24H:
+        t = TOKEN_24H
+        masked = t[:4] + '...' + t[-4:] if len(t) > 8 else '****'
+
+    return jsonify({
+        'tokenMasked': masked,
+        'updatedAt': TOKEN_24H_UPDATED_AT,
+        'expiresAt': expires_at,
+        'secondsLeft': seconds_left
+    })
+
+
+@app.route('/token', methods=['POST'])
+def update_token():
+    """Update the 24-hour token with validation and persist to token.py"""
+    global TOKEN_24H, TOKEN_24H_UPDATED_AT
+    data = request.get_json(force=True) or {}
+    new_token = (data.get('token') or '').strip()
+
+    # Validation per requirements
+    if not new_token:
+        return jsonify({'error': 'Token must not be empty'}), 400
+    if new_token.isalpha():
+        return jsonify({'error': 'Token must not be only letters'}), 400
+    if new_token.isdigit():
+        return jsonify({'error': 'Token must not be only numbers'}), 400
+    if '-' not in new_token:
+        return jsonify({'error': 'Token must contain a dash (-)'}), 400
+
+    now_dt = datetime.utcnow()
+    now_iso = now_dt.isoformat()
+
+    # If token changed, treat as a new token and reset timer to 24h
+    if new_token != TOKEN_24H:
+        TOKEN_24H = new_token
+        TOKEN_24H_UPDATED_AT = now_iso
+        try:
+            write_token_to_file(new_token, now_iso)
+        except Exception as e:
+            return jsonify({'error': f'Failed to write token file: {e}'}), 500
+
+        seconds_left = 24 * 3600
+        return jsonify({'ok': True, 'updatedAt': now_iso, 'secondsLeft': seconds_left, 'reset': True})
+
+    # If token is the same, do NOT reset the timestamp; return remaining time
+    if TOKEN_24H_UPDATED_AT:
+        try:
+            updated_dt = datetime.fromisoformat(TOKEN_24H_UPDATED_AT)
+            expires_at = updated_dt + timedelta(hours=24)
+            seconds_left = int(max(0, (expires_at - datetime.utcnow()).total_seconds()))
+        except Exception:
+            # Fallback: if parsing fails, assume expired
+            seconds_left = 0
+    else:
+        # No recorded timestamp yet: initialize it now (first time submission)
+        TOKEN_24H_UPDATED_AT = now_iso
+        try:
+            write_token_to_file(TOKEN_24H, TOKEN_24H_UPDATED_AT)
+        except Exception as e:
+            return jsonify({'error': f'Failed to write token file: {e}'}), 500
+        seconds_left = 24 * 3600
+
+    return jsonify({'ok': True, 'updatedAt': TOKEN_24H_UPDATED_AT, 'secondsLeft': seconds_left, 'reset': False})
 
 
 if __name__ == '__main__':
