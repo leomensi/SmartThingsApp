@@ -1,0 +1,84 @@
+Project: Medianet AC Monitoring
+Date: 2026-02-24
+
+1) Project summary
+- Purpose: Collect energy and telemetry from air-conditioning units using the SmartThings platform, persist readings to PostgreSQL, and provide REST endpoints and CSV export for dashboards and analysis.
+- Main components: a Flask backend service, an Angular frontend, PostgreSQL database, and Docker compose for deployment.
+
+2) Key files & locations
+- Backend service: Backend/Smartthingapp.py — main application, background sync, DB access, API endpoints.
+- Backend dependencies: backend/requirements.txt (flask, flask-cors, requests, psycopg2-binary, gunicorn, python-dotenv).
+- Frontend: frontend/ (Angular app and server-side entry points).
+- Deployment: docker-compose.yml and Dockerfiles in both backend/ and frontend/.
+- Token persistence: token.py (written by the backend when a 24h token is updated).
+
+3) SmartThings API — overview & how we use it (concise)
+- Platform: Samsung SmartThings cloud REST API (v1).
+- Endpoints used by this project:
+  - GET https://api.smartthings.com/v1/devices — list devices (we read deviceId, label/name, locationId).
+  - GET https://api.smartthings.com/v1/devices/{deviceId}/status — read component telemetry and the powerConsumptionReport payload used to compute energy deltas.
+- Authentication: Bearer token in the HTTP `Authorization` header. Example: `Authorization: Bearer <token>`.
+- Token type: This project uses a single short-lived 24-hour token only (NOT the full OAuth flow with refresh tokens). The service expects an externally obtained API token and treats it as valid for up to 24 hours from the time it was set.
+
+4) 24-hour token behavior and policy (important)
+- The backend stores a single token in memory and persists it to `token.py` when updated via the `/token` POST endpoint.
+- The token is considered valid for exactly 24 hours from the recorded `TOKEN_24H_UPDATED_AT` timestamp.
+- The `/token` GET endpoint returns a masked token, the `updatedAt`, calculated `expiresAt`, and `secondsLeft` until expiry.
+- When a new token value (different string) is POSTed to `/token`, the backend updates the in-memory token, sets `TOKEN_24H_UPDATED_AT` to the current UTC time, and writes the values to `token.py`; this resets the 24-hour window.
+- If the same token string is POSTed again, the backend does NOT reset the timestamp (intentional by design) and will return remaining seconds left.
+- Validation enforced on token input: token must not be empty, must contain a dash (`-`), and must not be only letters or only digits. This is a light heuristic validation only.
+- Operational implication: operators must obtain or rotate the SmartThings personal/access token every 24 hours (or POST a new token before expiry) to keep background fetches working. If the token expires, SmartThings API calls will fail with 401 and the backend will report fetch errors via `/fetch_status`.
+
+5) Data flow & storage
+- Background sync: `background_loop()` aligns to five-minute boundaries, calls `fetch_and_store()` to query SmartThings and write telemetry.
+- `fetch_and_store()`:
+  - Requests device list, then for each device requests `/status`.
+  - Extracts `powerConsumptionReport` values: `deltaEnergy` (Wh) and `energy` (cumulative Wh), plus component telemetry (humidity, temperature, AC mode, fan mode) when present.
+  - Converts and adjusts deltas with `compute_adjusted_delta` to avoid counting repeated API samples as new usage.
+  - Persists rows to PostgreSQL table `ac_monitoring` (see schema summary below).
+- Export: `/export` generates a CSV (in-memory) and serves it as an attachment for downstream analysis.
+
+6) Database schema (summary)
+- Table: `ac_monitoring`
+  - `id` (serial primary key)
+  - `device_name` (text)
+  - `location` (text)
+  - `delta_kwh` (float) — stored in kWh (converted from Wh)
+  - `cumulative_wh` (float) — as reported by device
+  - `reading_day` (date) — local calendar day when the reading was stored
+  - `timestamp` (timestamp) — server insert time by default
+  - `humidity`, `temperature_c`, `air_conditioner_mode`, `fan_mode` — optional telemetry
+  - `api_timestamp` — original timestamp from device/report when available
+
+7) Backend API endpoints (summary)
+- `GET /dashboard` — returns per-device totals for today and a rolling 24h kWh value plus latest telemetry.
+- `GET /dashboard/hourly` — hourly aggregated kWh per device for the last 24h.
+- `GET /history?deviceName=...&location=...&hours=...` — returns recent raw rows for a device.
+- `GET /export` — CSV export of stored rows.
+- `GET /fetch_status` — diagnostics: last background fetch success/failure and message.
+- `GET /token` — returns masked token info and seconds until the 24h expiry.
+- `POST /token` — update the 24-hour token (validates and writes token.py).
+
+8) Operational notes & recommendations
+- Token rotation: Because the system relies on a 24h token only, create an operational process (cron, scheduled job, or manual alert) to rotate the token before expiry to avoid data gaps.
+- Secure storage: The project persists the token to `token.py` in plain text; restrict filesystem access and prefer a secrets store (Vault, cloud secret manager) in production.
+- Monitoring: Surface `fetch_status` into the frontend or an alerting system so operators know when the SmartThings calls begin failing with 401.
+- Rate limits & retries: The implementation performs sequential per-device status calls; consider batching or respecting API rate limits. The code includes simple 401 handling and records failure states.
+
+9) Deployment & environment
+- Environment variables used by the backend: `DB_HOST`, `DB_USER`, `DB_PASSWORD`, `DB_NAME` (defaults are provided in the code).
+- Requirements (see `backend/requirements.txt`): `flask`, `flask-cors`, `requests`, `psycopg2-binary`, `gunicorn`, `python-dotenv`.
+- The repository includes Dockerfiles for containerized deployment and `docker-compose.yml` for local orchestration.
+
+10) Where to look for more details or to modify behavior
+- Background sync timing, fetch behavior, and token handling are implemented in `Backend/Smartthingapp.py` — review functions: `background_loop()`, `fetch_and_store()`, `compute_adjusted_delta()`, and `/token` endpoints.
+- Database initialization is performed by `init_db()` in the same file; schema changes should be migrated carefully.
+
+Contact / next steps
+- If you want, I can:
+  - Update the documentation with screenshots or example API responses.
+  - Convert this `.txt` into a nicely formatted `README.md` for git.
+  - Add a small script to automatically rotate tokens (if you can provide secure token provisioning).
+
+---
+Generated by the project maintainer team on 2026-02-24.

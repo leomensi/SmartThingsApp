@@ -103,99 +103,53 @@ def init_db():
 
 
 def _parse_report_timestamp(val):
-    """Try to parse a timestamp value from the API report into a Python datetime or None.
-
-    Accepts ISO strings or integer epoch (seconds or milliseconds).
-    """
     if not val:
         return None
     try:
-        # numeric epoch?
         if isinstance(val, (int, float)):
-            # if milliseconds, assume > 10^12
+            # Handle epoch timestamps
             if val > 1e12:
-                return datetime.fromtimestamp(val / 1000.0)
-            return datetime.fromtimestamp(val)
-        s = str(val)
-        # try ISO
-        try:
-            return datetime.fromisoformat(s)
-        except Exception:
-            pass
-        # try integer string
-        if s.isdigit():
-            v = int(s)
-            if v > 1e12:
-                return datetime.fromtimestamp(v / 1000.0)
-            return datetime.fromtimestamp(v)
-    except Exception:
+                dt = datetime.fromtimestamp(val / 1000.0)
+            else:
+                dt = datetime.fromtimestamp(val)
+        else:
+            # Handle ISO strings (e.g., 2026-02-20T10:16:14Z)
+            s = str(val).replace('Z', '+00:00')
+            dt = datetime.fromisoformat(s)
+        
+        # CRITICAL FIX: Strip timezone info to match Postgres naive timestamps
+        return dt.replace(tzinfo=None)
+    except Exception as e:
+        print(f"Timestamp parse error: {e}")
         return None
-    return None
-
 
 def compute_adjusted_delta(cur, device_name: str, api_ts, new_delta_wh: float):
-    """Compute adjusted delta energy in Wh.
-
-    If api_ts matches the previous API timestamp for this device, return
-    new_delta_wh - previous_delta_wh (previous stored delta converted back to Wh).
-    Otherwise return new_delta_wh.
-
-    `cur` is an open DB cursor.
-    """
     if api_ts is None:
         return new_delta_wh
 
     try:
-        # Fetch the latest stored row for this device
         cur.execute(
-            "SELECT delta_kwh, api_timestamp FROM ac_monitoring WHERE device_name = %s ORDER BY id DESC LIMIT 1;",
+            "SELECT api_timestamp FROM ac_monitoring WHERE device_name = %s ORDER BY id DESC LIMIT 1;",
             (device_name,)
         )
         row = cur.fetchone()
-        if not row:
-            return new_delta_wh
-
-        prev_delta_kwh, prev_api_ts = row[0], row[1]
-        if prev_api_ts is None:
-            return new_delta_wh
-
-        # Normalize datetimes for comparison
-        if isinstance(prev_api_ts, str):
-            try:
-                prev_api_dt = datetime.fromisoformat(prev_api_ts)
-            except Exception:
-                prev_api_dt = None
-        else:
-            prev_api_dt = prev_api_ts
-
-        if prev_api_dt is None:
-            return new_delta_wh
-
-        # If timestamps are effectively the same (within 1 second), adjust
-        try:
-            if abs((prev_api_dt - api_ts).total_seconds()) < 1:
-                prev_delta_wh = (prev_delta_kwh or 0) * 1000.0
-                adjusted = new_delta_wh - prev_delta_wh
-                # if adjusted negative or tiny, fallback to new_delta_wh
-                if adjusted <= 0:
-                    return new_delta_wh
-                return adjusted
-        except Exception:
-            # fallback to strict equality if subtraction fails
-            if prev_api_dt == api_ts:
-                prev_delta_wh = (prev_delta_kwh or 0) * 1000.0
-                adjusted = new_delta_wh - prev_delta_wh
-                if adjusted <= 0:
-                    return new_delta_wh
-                return adjusted
+        
+        if row and row[0] is not None:
+            prev_api_ts = row[0]
             
+            # If DB timestamp is aware, make it naive
+            if hasattr(prev_api_ts, 'tzinfo') and prev_api_ts.tzinfo is not None:
+                prev_api_ts = prev_api_ts.replace(tzinfo=None)
+            
+            # Now both are naive, subtraction will work
+            if abs((prev_api_ts - api_ts).total_seconds()) < 1:
+                return 0.0
+
     except Exception as e:
-        # on any error, don't disrupt main flow
-        print(f"compute_adjusted_delta error: {e}")
-        return new_delta_wh
-
+        # This will catch the error you saw and print details if it fails again
+        print(f"Error comparing timestamps: {e}")
+        
     return new_delta_wh
-
 def fetch_and_store():
     """Talks to SmartThings and stores data - single API call for all devices"""
     
@@ -231,32 +185,28 @@ def fetch_and_store():
         for d in devices:
             d_id = d['deviceId']
             d_name = d.get('label') or d.get('name') or "Unknown AC"
+            real_loc_id = d.get('locationId') or "unknown_location"
             
             # Fetch detailed status
+        # Inside the loop: for d in devices:
             s_res = requests.get(f"https://api.smartthings.com/v1/devices/{d_id}/status", headers=headers)
             if s_res.status_code == 200:
                 data = s_res.json()
                 main = data.get('components', {}).get('main', {})
                 
-                # Get location info from device
-                real_loc_id = d.get('locationId', 'Unknown Location')
+                # Define pc_root here
+                pc_root = main.get('powerConsumptionReport', {}).get('powerConsumption', {})
                 
-                report = main.get('powerConsumptionReport', {}).get('powerConsumption', {}).get('value', {})
-                delta_wh = report.get('deltaEnergy')
-                cum_wh = report.get('energy') 
-                if delta_wh is None:
-                    # Suppress verbose notice messages
-                    delta_wh = 0
-                    cum_wh = cum_wh or 0
-
-                # Try to read API-provided timestamp (various possible keys)
-                report_ts_raw = None
-                for k in ('timestamp', 'time', 'timeStamp', 'reportedAt'):
-                    if k in report:
-                        report_ts_raw = report.get(k)
-                        break
+                report_values = pc_root.get('value', {})
+                cum_wh = report_values.get('energy', 0)
+                delta_wh = report_values.get('deltaEnergy', 0)
+                
+                # Use pc_root for the timestamp
+                report_ts_raw = pc_root.get('timestamp')
                 api_ts = _parse_report_timestamp(report_ts_raw)
-
+                
+                # Calculate
+                adjusted_delta_wh = compute_adjusted_delta(cur, d_name, api_ts, float(delta_wh))
                 # New telemetry fields
                 humidity = None
                 temperature_c = None
@@ -582,7 +532,8 @@ def export_csv():
                 )
             ) / 1000.0 as rolling_24h_kwh
         FROM ac_monitoring t1
-        ORDER BY t1.timestamp DESC ;
+        ORDER BY t1.timestamp DESC  -- This now sorts by newest data first
+        LIMIT 70000;
     '''
     
     cur.execute(query)
